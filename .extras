@@ -1,0 +1,22 @@
+#! /bin/bash
+
+# docker
+export DOCKER_HOST=tcp://192.168.59.103:2376
+export DOCKER_CERT_PATH=/Users/dduffett/.boot2docker/certs/boot2docker-vm
+export DOCKER_TLS_VERIFY=1
+
+# rbenv
+eval "$(rbenv init -)"
+
+# node
+export NVM_DIR="/Users/dduffett/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+NPM_PACKAGES=/Users/dduffett/.npm-packages
+NODE_PATH="$NPM_PACKAGES/lib/node_modules:$NODE_PATH"
+PATH="$NPM_PACKAGES/bin:$PATH"
+
+# go
+export GOPATH=$HOME/Projects/go
+export PATH=$PATH:/usr/local/go/bin
+export PATH=$PATH:$GOPATH/bin
+export PATH=$PATH:/Users/dduffett/.local/bin
