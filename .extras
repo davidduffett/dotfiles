@@ -4,9 +4,9 @@
 eval "$(rbenv init -)"
 
 # node
-export NVM_DIR="/Users/dduffett/.nvm"
+export NVM_DIR="/$HOME/.nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
-NPM_PACKAGES=/Users/dduffett/.npm-packages
+NPM_PACKAGES=/$HOME/.npm-packages
 NODE_PATH="$NPM_PACKAGES/lib/node_modules:$NODE_PATH"
 PATH="$NPM_PACKAGES/bin:$PATH"
 
@@ -14,8 +14,11 @@ PATH="$NPM_PACKAGES/bin:$PATH"
 export GOPATH=$HOME/Projects/go
 export PATH=$PATH:/usr/local/go/bin
 export PATH=$PATH:$GOPATH/bin
-export PATH=$PATH:/Users/dduffett/.local/bin
+export PATH=$PATH:/$HOME/.local/bin
 
 # java
 export JAVA_HOME=$(/usr/libexec/java_home)
 export PATH=$PATH:$JAVA_HOME/bin
+
+# rust
+export PATH=$PATH:/$HOME/.cargo/bin
