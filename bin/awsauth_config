@@ -1,0 +1,6 @@
+ADFS_SIGNIN_HOST="sts.myseek.xyz"
+ADFS_RELYING_PARTY_ID="urn:amazon:webservices"
+TOKEN_DURATION="3600"
+DEFAULT_AD_USER="dduffett@seek.com.au"
+PROMPT_AD_USER_SKIP=""
+AWS_CLI_SET_PROFILE_CREDENTIALS=""
