@@ -1,11 +1,13 @@
 #!/bin/bash -e
 
 DIRNAME=$(dirname "$0")
-CONFIG_FILE="$DIRNAME/awsauth_config"
-AWS_CONF_DIR="$HOME/.aws"
 
-AWS_CLI_BIN=$(which aws || true)
-CURL_BIN=$(which curl || true)
+AWS_CONFIG_DIR="$HOME/.aws"
+CONFIG_SYSTEM="$DIRNAME/awsauthconfig"
+CONFIG_USER="$AWS_CONFIG_DIR/awsauthsaml"
+
+AWS_CLI_BIN=$(which aws || :)
+CURL_BIN=$(which curl || :)
 CURL_USER_AGENT="curl/awssamlcliauth"
 
 MFA_AUTH_METHOD="AzureMfaAuthentication"
@@ -15,11 +17,12 @@ MFA_DEVICE_MAX_WAIT_TRIES=10
 
 USER_FILE_CHMOD="0600"
 ROLE_SELECT_REGEXP="^[0-9]{1,3}$"
-SAML_RESPONSE_PERSIST_FILE="$AWS_CONF_DIR/samlresponsepersist"
-AWS_SESSION_TOKEN_ENV_FILE="$AWS_CONF_DIR/sessiontoken"
+SAML_RESPONSE_PERSIST_FILE="$AWS_CONFIG_DIR/samlresponsepersist"
+AWS_SESSION_TOKEN_ENV_FILE="$AWS_CONFIG_DIR/sessiontoken"
 SAML_RESPONSE_EXPIRE_OFFSET_SECONDS="-10"
+TOKEN_DURATION_DEFAULT="3600"
 
-MKTEMP_TEMPLATE="$AWS_CONF_DIR/tmp.XXXXX"
+MKTEMP_TEMPLATE="$AWS_CONFIG_DIR/tmp.XXXXX"
 
 
 function exitError {
@@ -36,14 +39,15 @@ function writePrompt {
 function writeInfo {
 
 	# no info messages if muted toggle set
-	[[ -n $optionInfoMessageMute ]] && return
+	[[ $optionInfoMessageMute ]] && return
 	echo "${1:+Info: }$1"
 }
 
 function getTempFile {
 
-	tempFile=$(mktemp -q "$MKTEMP_TEMPLATE") \
-		|| exitError "Unable to create temporary file"
+	local tempFile
+	tempFile=$(mktemp -q "$MKTEMP_TEMPLATE") || \
+		exitError "unable to create temporary file"
 
 	echo "$tempFile"
 }
@@ -59,7 +63,7 @@ function getJSONValue {
 
 function getUTCDateSecondOffset {
 
-	# Linux or BSD date?
+	# Linux or BSD date binary?
 	set +e
 	date -v 0S >/dev/null 2>&1
 	retVal=$?
@@ -91,31 +95,35 @@ EOM
 	exit 2
 }
 
-function loadConfiguration {
+function loadConfig {
 
-	# able to locate config file?
-	if [[ ! -f $CONFIG_FILE ]]; then
-		exitError "Unable to find $CONFIG_FILE"
-	fi
-
-	# load in config
-	. "$CONFIG_FILE"
+	# load system and user config files
+	[[ -f $CONFIG_SYSTEM ]] && . "$CONFIG_SYSTEM"
+	[[ -f $CONFIG_USER ]] && . "$CONFIG_USER"
 
 	# all mandatory settings present?
-	if [[ (-z $ADFS_SIGNIN_HOST) || (-z $ADFS_RELYING_PARTY_ID) || (-z $TOKEN_DURATION) ]]; then
-		exitError "One or more mandatory $CONFIG_FILE settings are missing"
+	if [[ -z $ADFS_SIGNIN_HOST ]]; then
+		exitError "no config value set for [\$ADFS_SIGNIN_HOST]"
 	fi
+
+	if [[ -z $ADFS_RELYING_PARTY_ID ]]; then
+		exitError "no config value set for [\$ADFS_RELYING_PARTY_ID]"
+	fi
+
+	# if no [$TOKEN_DURATION] defined, set a default
+	TOKEN_DURATION=${TOKEN_DURATION:-$TOKEN_DURATION_DEFAULT}
 }
 
-function initAWSConfDirectory {
+function initAWSConfigDirectory {
 
-	# if AWS configuration directory does not exist, create now
-	if [[ ! -d $AWS_CONF_DIR ]]; then
-		writeInfo "Unable to locate $AWS_CONF_DIR - creating"
+	# does AWS configuration directory exist?
+	if [[ ! -d $AWS_CONFIG_DIR ]]; then
+		writeInfo "unable to locate $AWS_CONFIG_DIR - creating"
 		writeInfo
 
-		mkdir -p "$AWS_CONF_DIR"
-		chmod 0700 "$AWS_CONF_DIR"
+		# create, and set low permissions
+		mkdir -p "$AWS_CONFIG_DIR"
+		chmod 0700 "$AWS_CONFIG_DIR"
 	fi
 
 	# clear out any orphan temp files
@@ -156,11 +164,11 @@ function loadPersistedSAMLResponse {
 		if [[ $timeTestTempFile -nt $SAML_RESPONSE_PERSIST_FILE ]]; then
 			# SAML response persist file data has expired - remove from disk
 			rm -f "$SAML_RESPONSE_PERSIST_FILE"
-			writeInfo "Previously saved SAML assertion has now expired"
+			writeInfo "previously saved SAML assertion has now expired"
 
 		else
 			# able to reuse previous SAML assertion payload from disk
-			writeInfo "Reusing previously saved SAML assertion as authorisation"
+			writeInfo "reusing previously saved SAML assertion as authorisation"
 			setSAMLResponse "$(cat -v "$SAML_RESPONSE_PERSIST_FILE")"
 		fi
 
@@ -175,14 +183,14 @@ function doADFSAuth {
 
 	# has default username been provided in config? if so - use it, otherwise $USER
 	local defaultADUser=${DEFAULT_AD_USER:-$USER}
-	local enteredUsername=""
-	local enteredPassword=""
-	local enteredVerificationCode=""
+	local enteredUsername
+	local enteredPassword
+	local enteredVerificationCode
 
-	echo -e "Please authenticate against [$ADFS_SIGNIN_HOST]\n"
+	writePrompt "Please authenticate against [$ADFS_SIGNIN_HOST]\n"
 
-	if [[ -n $PROMPT_AD_USER_SKIP ]]; then
-		writePrompt "Username is [$defaultADUser]"
+	if [[ $PROMPT_AD_USER_SKIP ]]; then
+		writePrompt "Username is [${defaultADUser//\\/\\\\}]"
 
 	else
 		# get username from terminal
@@ -224,7 +232,7 @@ function doADFSAuth {
 			--silent \
 			--user-agent "$CURL_USER_AGENT" \
 			--write-out "%{http_code}:%{url_effective}" \
-			"https://$ADFS_SIGNIN_HOST/adfs/ls/idpinitiatedsignon?loginToRp=$ADFS_RELYING_PARTY_ID/" || true
+			"https://$ADFS_SIGNIN_HOST/adfs/ls/idpinitiatedsignon?loginToRp=$ADFS_RELYING_PARTY_ID/" || :
 	)
 
 	local responsePayload=$(doADFSAuthLoadResponse "$responseTempFile")
@@ -260,7 +268,7 @@ function doADFSAuth {
 
 		# determine if code input or device authorisation mode
 		if [[ $responsePayload =~ \<input\ id=\"verificationCodeInput\" ]]; then
-			while [[ 1 ]]; do
+			while :; do
 				# get verification code from user
 				while [[ -z $enteredVerificationCode ]]; do
 					read -rp "Verification code: " enteredVerificationCode
@@ -268,7 +276,7 @@ function doADFSAuth {
 					# is code entered in a valid form?
 					if [[ ! $enteredVerificationCode =~ $MFA_VERIFICATION_CODE_REGEXP ]]; then
 						writePrompt "\nInvalid verification code format"
-						enteredVerificationCode=""
+						enteredVerificationCode=
 					fi
 
 					writePrompt
@@ -292,17 +300,17 @@ function doADFSAuth {
 
 				# invalid code, present message and try again
 				writePrompt "Verification code given does not match expected from authorisation server\n"
-				enteredVerificationCode=""
+				enteredVerificationCode=
 			done
 
 		else
 			# awaiting device authorisation
 			local deviceVerifyAttempt=0
-			while [[ 1 ]]; do
+			while :; do
 				# bail out if more attempts have been made than allowed to confirm verification
 				if [[ $deviceVerifyAttempt -ge $MFA_DEVICE_MAX_WAIT_TRIES ]]; then
 					echo
-					exitError "Did not receive a timely MFA device verification"
+					exitError "did not receive a timely MFA device verification"
 				fi
 
 				writePrompt "Waiting for device authorisation..."
@@ -380,7 +388,7 @@ function doADFSAuthVerifyMFAContextToken {
 
 	if [[ -z $1 ]]; then
 		rm -f "$2"
-		exitError "Unable to fetch next MFA context token"
+		exitError "unable to fetch next MFA context token"
 	fi
 }
 
@@ -396,7 +404,7 @@ function doADFSAuthPostMFARequest {
 		--output "$5" \
 		--silent \
 		--user-agent "$CURL_USER_AGENT" \
-		"$4" || true
+		"$4" || :
 
 	doADFSAuthLoadResponse "$5"
 }
@@ -416,7 +424,7 @@ function parseSAMLRoleList {
 	local SAMLAttribValueData=$(echo -n "$SAMLResponseDecoded" | sed -E "s/<AttributeValue>(arn:aws:iam::)/\\${IFS}\1/g")
 
 	# build up role list in [IAMRoleListSorted], one role per line with the role name as prefix (to allow alpha-sorting)
-	local IAMRoleListSorted=""
+	local IAMRoleListSorted
 	local roleItem
 
 	for roleItem in $SAMLAttribValueData; do
@@ -444,7 +452,7 @@ function renderAndSelectIAMRole {
 
 	# save total role count and variable to hold selected IAM role array index
 	local roleCount=${#IAMRoleList[@]}
-	local selectedIAMRoleIndex=""
+	local selectedIAMRoleIndex
 
 	if [[ -z $optionAutoSelectIAMRoleName ]]; then
 		# render SAML role list
@@ -467,7 +475,7 @@ function renderAndSelectIAMRole {
 				if [[ $selectedIAMRoleIndex -ge $roleCount ]]; then
 					# selected role outside range
 					writePrompt "Invalid role number - valid options between [0..$((roleCount - 1))]"
-					selectedIAMRoleIndex=""
+					selectedIAMRoleIndex=
 				fi
 
 				writePrompt
@@ -489,7 +497,7 @@ function renderAndSelectIAMRole {
 
 		if [[ -z $selectedIAMRoleIndex ]]; then
 			# didn't make match with an IAM role name - exit in error
-			exitError "Unable to locate the IAM role named [$optionAutoSelectIAMRoleName] from available"
+			exitError "unable to locate the IAM role named [$optionAutoSelectIAMRoleName] from available"
 		fi
 	fi
 
@@ -500,38 +508,35 @@ function renderAndSelectIAMRole {
 
 	else
 		# something went bad
-		exitError "Unexpected ARN role format"
+		exitError "unexpected ARN role format"
 	fi
 }
 
 function setAWSProfileCredentialKey {
 
 	"$AWS_CLI_BIN" \
-		--profile "$AWS_CLI_SET_PROFILE_CREDENTIALS" \
+		--profile "$1" \
 		configure set \
-		"$1" "$2"
+		"$2" "$3"
 }
 
 
 # parse command line options
-optionAutoSelectIAMRoleName=""
-optionInfoMessageMute=""
+optionAutoSelectIAMRoleName=
+optionInfoMessageMute=
 while getopts ":r:qh" optKey; do
 	case $optKey in
 		r)
 			optionAutoSelectIAMRoleName=$OPTARG
 			;;
 		q)
-			optionInfoMessageMute="true"
+			optionInfoMessageMute=:
 			;;
 		h|*)
 			usage
 			;;
 	esac
 done
-
-# load configuration
-loadConfiguration
 
 # ensure required binaries exist
 if [[ ! -x $AWS_CLI_BIN ]]; then
@@ -542,10 +547,9 @@ if [[ ! -x $CURL_BIN ]]; then
 	exitError "cURL not installed"
 fi
 
-# setup the AWS config directory
-initAWSConfDirectory
-
-# destroy existing session token set
+# load configuration, setup AWS config directory and clear out any existing session token set file
+loadConfig
+initAWSConfigDirectory
 destroySessionToken
 
 # attempt to load and re-use a previously save SAML assertion response
@@ -563,12 +567,12 @@ parseSAMLRoleList
 renderAndSelectIAMRole
 
 # assume selected AWS SAML role
-writeInfo "Assuming role [$selectedAWSRoleARN] via SAML provider [$selectedAWSPrincipalARN]"
+writeInfo "assuming role [$selectedAWSRoleARN] via SAML provider [$selectedAWSPrincipalARN]"
 
 set +e
 SAMLAuthResult=$(
 	"$AWS_CLI_BIN" sts assume-role-with-saml \
-		--duration-seconds $TOKEN_DURATION \
+		--duration-seconds "$TOKEN_DURATION" \
 		--output json \
 		--principal-arn "$selectedAWSPrincipalARN" \
 		--role-arn "$selectedAWSRoleARN" \
@@ -579,7 +583,7 @@ retVal=$?
 set -e
 
 if [[ $retVal -ne 0 ]]; then
-	exitError "Unable to assume role"
+	exitError "unable to assume role"
 fi
 
 # extract key values from JSON response payload
@@ -588,23 +592,23 @@ AWSSecretAccessKey=$(getJSONValue "$SAMLAuthResult" "SecretAccessKey")
 AWSSessionToken=$(getJSONValue "$SAMLAuthResult" "SessionToken")
 
 if [[ (-z $AWSAccessKey) || (-z $AWSSecretAccessKey) || (-z $AWSSessionToken) ]]; then
-	exitError "Unable to obtain required credentials"
+	exitError "unable to obtain credentials"
 fi
 
 # access credentials are all good
-writeInfo "Successfully fetched environment credentials"
+writeInfo "successfully fetched credentials"
 writeInfo
 
 if [[ -n $AWS_CLI_SET_PROFILE_CREDENTIALS ]]; then
 	# set/update AWS CLI credentials profile
-	setAWSProfileCredentialKey "aws_access_key_id" "$AWSAccessKey"
-	setAWSProfileCredentialKey "aws_secret_access_key" "$AWSSecretAccessKey"
-	setAWSProfileCredentialKey "aws_session_token" "$AWSSessionToken"
+	setAWSProfileCredentialKey "$AWS_CLI_SET_PROFILE_CREDENTIALS" "aws_access_key_id" "$AWSAccessKey"
+	setAWSProfileCredentialKey "$AWS_CLI_SET_PROFILE_CREDENTIALS" "aws_secret_access_key" "$AWSSecretAccessKey"
+	setAWSProfileCredentialKey "$AWS_CLI_SET_PROFILE_CREDENTIALS" "aws_session_token" "$AWSSessionToken"
 
 	writeInfo "AWS CLI profile [$AWS_CLI_SET_PROFILE_CREDENTIALS] credentials updated"
 
 else
-	# export tokens to $AWS_SESSION_TOKEN_ENV_FILE for evaluation by parent environment
+	# export tokens to file for evaluation by parent environment
 	initSessionTokenFile
 
 	# note: setting [AWS_SECURITY_TOKEN] as it's used by some older API implements (such at boto) - hopefully it can be removed at a future date
@@ -616,8 +620,5 @@ export AWS_SECURITY_TOKEN="$AWSSessionToken"
 export AWS_ROLE_IDENTIFIER="$selectedAWSRoleARN"
 EOF
 
-	writeInfo "Credentials written to [$AWS_SESSION_TOKEN_ENV_FILE]"
+	writeInfo "credentials written to [$AWS_SESSION_TOKEN_ENV_FILE]"
 fi
-
-# success
-exit 0

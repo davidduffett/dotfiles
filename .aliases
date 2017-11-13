@@ -9,7 +9,7 @@ alias ....="cd ../../.."
 alias .....="cd ../../../.."
 
 alias cdp="cd ~/Projects"
-alias cdgo="cd ~/Projects/go/src/github.com/jobseekerltd/"
+alias cdgo="cd ~/Projects/go/src/github.com/SEEK-Jobs/"
 
 alias ga="git add ."
 
