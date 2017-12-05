@@ -18,6 +18,7 @@ MFA_DEVICE_MAX_WAIT_TRIES=10
 USER_FILE_CHMOD="0600"
 ROLE_SELECT_REGEXP="^[0-9]{1,3}$"
 SAML_RESPONSE_PERSIST_FILE="$AWS_CONFIG_DIR/samlresponsepersist"
+AZURE_AD_AUTH_COOKIE_PERSIST_FILE="$AWS_CONFIG_DIR/azurecookiepersist"
 AWS_SESSION_TOKEN_ENV_FILE="$AWS_CONFIG_DIR/sessiontoken"
 SAML_RESPONSE_EXPIRE_OFFSET_SECONDS="-10"
 TOKEN_DURATION_DEFAULT="3600"
@@ -49,7 +50,7 @@ function getTempFile {
 	tempFile=$(mktemp -q "$MKTEMP_TEMPLATE") || \
 		exitError "unable to create temporary file"
 
-	echo "$tempFile"
+	echo -n "$tempFile"
 }
 
 function getJSONValue {
@@ -57,16 +58,22 @@ function getJSONValue {
 	# looking for ["JSON_PROPERTY": "VALUE"]
 	if [[ $1 =~ \"${2}\"\ *:\ *\"([^\"]*)\" ]]; then
 		# emit property VALUE
-		echo "${BASH_REMATCH[1]}"
+		echo -n "${BASH_REMATCH[1]}"
 	fi
+}
+
+function getTempResponsePayload {
+
+	[[ -f $1 ]] && cat -v "$1"
+	rm -f "$1"
 }
 
 function getUTCDateSecondOffset {
 
 	# Linux or BSD date binary?
 	set +e
-	date -v 0S >/dev/null 2>&1
-	retVal=$?
+	date -v 0S &>/dev/null
+	local retVal=$?
 	set -e
 
 	if [[ $retVal -eq 0 ]]; then
@@ -74,11 +81,11 @@ function getUTCDateSecondOffset {
 		date \
 			-jf "%Y-%m-%dT%H:%M:%S %z" \
 			-v "${2}S" \
-			"${1} +0000" "+${3}"
+			"$1 +0000" "+$3"
 
 	else
 		# Linux date
-		date --date "${1} +0000 ${2} seconds" "+${3}"
+		date --date "$1 +0000 $2 seconds" "+$3"
 	fi
 }
 
@@ -160,7 +167,6 @@ function loadPersistedSAMLResponse {
 	if [[ -f $SAML_RESPONSE_PERSIST_FILE ]]; then
 		# is persist file older than current time?
 		local timeTestTempFile=$(getTempFile)
-
 		if [[ $timeTestTempFile -nt $SAML_RESPONSE_PERSIST_FILE ]]; then
 			# SAML response persist file data has expired - remove from disk
 			rm -f "$SAML_RESPONSE_PERSIST_FILE"
@@ -179,7 +185,84 @@ function loadPersistedSAMLResponse {
 	fi
 }
 
-function doADFSAuth {
+function getADFSSiginURI {
+
+	echo -n "https://$ADFS_SIGNIN_HOST/adfs/ls/idpinitiatedsignon?loginToRp=$ADFS_RELYING_PARTY_ID/"
+}
+
+function getSAMLResponseTokenFromPayload {
+
+	if [[ $1 =~ \ name=\"SAMLResponse\"\ value=\"([A-Za-z0-9=+]+)\" ]]; then
+		echo -n "${BASH_REMATCH[1]}"
+	fi
+}
+
+function doSAMLResponsePersist {
+
+	# if able to locate expiry time for assertion, persist SAML response for re-use next auth attempt
+	if [[ $SAMLResponseDecoded =~ \<SubjectConfirmationData[^\>]NotOnOrAfter=\"([^.]+)\.[0-9]+Z\" ]]; then
+		# found expiry time - offset by [$SAML_RESPONSE_EXPIRE_OFFSET_SECONDS] to determine how long we keep reusing response
+		# save SAML response (not decoded) to disk, with time of file set to expiry
+		echo -n "$SAMLResponse" >"$SAML_RESPONSE_PERSIST_FILE"
+		chmod $USER_FILE_CHMOD "$SAML_RESPONSE_PERSIST_FILE"
+
+		touch \
+			-t "$(getUTCDateSecondOffset "${BASH_REMATCH[1]}" "$SAML_RESPONSE_EXPIRE_OFFSET_SECONDS" "%Y%m%d%H%M.%S")" \
+			"$SAML_RESPONSE_PERSIST_FILE"
+
+		local timeUntil=$(getUTCDateSecondOffset "${BASH_REMATCH[1]}" "$SAML_RESPONSE_EXPIRE_OFFSET_SECONDS" "%H:%M:%S")
+		writeInfo "SAML assertion saved for reuse until $timeUntil"
+		writeInfo
+	fi
+}
+
+function doAzureAuthCookieLogin {
+
+	if [[
+		$RETAIN_AZURE_AD_AUTH_COOKIES &&
+		(-f $AZURE_AD_AUTH_COOKIE_PERSIST_FILE)
+	]]; then
+		local responseTempFile=$(getTempFile)
+		local curlResponseHTTPCode=$(
+			"$CURL_BIN" \
+				--cookie "$AZURE_AD_AUTH_COOKIE_PERSIST_FILE" \
+				--output "$responseTempFile" \
+				--silent \
+				--user-agent "$CURL_USER_AGENT" \
+				--write-out "%{http_code}" \
+				"$(getADFSSiginURI)" || :
+		)
+
+		local responsePayload=$(getTempResponsePayload "$responseTempFile")
+
+		# expecting a 200 HTTP response
+		if [[ $curlResponseHTTPCode -eq 200 ]]; then
+			# attempt to extract SAML response token from payload
+			local SAMLResponseToken=$(getSAMLResponseTokenFromPayload "$responsePayload")
+
+			if [[ -n $SAMLResponseToken ]]; then
+				# success, SAML token received
+				writeInfo "successfully authorised via existing cookie tokens"
+
+				setSAMLResponse "$SAMLResponseToken"
+				doSAMLResponsePersist
+			fi
+		fi
+
+		if [[ -z $SAMLResponse ]]; then
+			# cookie tokens have now expired
+			rm -f "$AZURE_AD_AUTH_COOKIE_PERSIST_FILE"
+			writeInfo "existing cookie tokens are now invalidated"
+			writeInfo
+		fi
+
+	else
+		# ensure orphan persist file is removed
+		rm -f "$AZURE_AD_AUTH_COOKIE_PERSIST_FILE"
+	fi
+}
+
+function doUserCredsMFALogin {
 
 	# has default username been provided in config? if so - use it, otherwise $USER
 	local defaultADUser=${DEFAULT_AD_USER:-$USER}
@@ -220,7 +303,6 @@ function doADFSAuth {
 	# note: request must accept cookies, so using --cookie-jar argument
 	local responseTempFile=$(getTempFile)
 	local curlCookieJarTempFile=$(getTempFile)
-
 	local curlResponseData=$(
 		"$CURL_BIN" \
 			--cookie-jar "$curlCookieJarTempFile" \
@@ -232,10 +314,10 @@ function doADFSAuth {
 			--silent \
 			--user-agent "$CURL_USER_AGENT" \
 			--write-out "%{http_code}:%{url_effective}" \
-			"https://$ADFS_SIGNIN_HOST/adfs/ls/idpinitiatedsignon?loginToRp=$ADFS_RELYING_PARTY_ID/" || :
+			"$(getADFSSiginURI)" || :
 	)
 
-	local responsePayload=$(doADFSAuthLoadResponse "$responseTempFile")
+	local responsePayload=$(getTempResponsePayload "$responseTempFile")
 
 	# if no redirection made to include [client-request-id=] in the URI then consider this a username/password fail
 	if [[ ! $curlResponseData =~ ^200:(https:.+=$ADFS_RELYING_PARTY_ID/\&client-request-id=[a-f0-9-]+)$ ]]; then
@@ -249,8 +331,8 @@ function doADFSAuth {
 	# Two possible paths from here:
 	# a) No MFA enabled, you *should* have a [SAMLResponse] as this point
 	# b) MFA is enabled, need to provide a valid verification code
-	local MFAContextToken=$(doADFSAuthGetMFAContextToken "$responsePayload")
-	local SAMLResponseToken=$(doADFSAuthGetSAMLResponseToken "$responsePayload")
+	local MFAContextToken=$(doUserCredsMFALoginGetMFAContextToken "$responsePayload")
+	local SAMLResponseToken=$(getSAMLResponseTokenFromPayload "$responsePayload")
 
 	# determine if MFA challenge presented
 	if [[ -z $SAMLResponseToken ]]; then
@@ -258,13 +340,13 @@ function doADFSAuth {
 
 		# make first request, swapping context token with another (required by Azure AD)
 		responsePayload=$(
-			doADFSAuthPostMFARequest \
+			doUserCredsMFALoginPostMFARequest \
 				"$curlCookieJarTempFile" "$MFAContextToken" "" \
 				"$MFARequestURL" "$responseTempFile"
 		)
 
-		MFAContextToken=$(doADFSAuthGetMFAContextToken "$responsePayload")
-		doADFSAuthVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
+		MFAContextToken=$(doUserCredsMFALoginGetMFAContextToken "$responsePayload")
+		doUserCredsMFALoginVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
 
 		# determine if code input or device authorisation mode
 		if [[ $responsePayload =~ \<input\ id=\"verificationCodeInput\" ]]; then
@@ -284,19 +366,19 @@ function doADFSAuth {
 
 				# correct MFA code entered?
 				responsePayload=$(
-					doADFSAuthPostMFARequest \
+					doUserCredsMFALoginPostMFARequest \
 						"$curlCookieJarTempFile" "$MFAContextToken" "$enteredVerificationCode" \
 						"$MFARequestURL" "$responseTempFile"
 				)
 
-				SAMLResponseToken=$(doADFSAuthGetSAMLResponseToken "$responsePayload")
+				SAMLResponseToken=$(getSAMLResponseTokenFromPayload "$responsePayload")
 				if [[ -n $SAMLResponseToken ]]; then
 					# yes, bail out with success
 					break
 				fi
 
-				MFAContextToken=$(doADFSAuthGetMFAContextToken "$responsePayload")
-				doADFSAuthVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
+				MFAContextToken=$(doUserCredsMFALoginGetMFAContextToken "$responsePayload")
+				doUserCredsMFALoginVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
 
 				# invalid code, present message and try again
 				writePrompt "Verification code given does not match expected from authorisation server\n"
@@ -309,6 +391,8 @@ function doADFSAuth {
 			while :; do
 				# bail out if more attempts have been made than allowed to confirm verification
 				if [[ $deviceVerifyAttempt -ge $MFA_DEVICE_MAX_WAIT_TRIES ]]; then
+					rm -f "$curlCookieJarTempFile"
+
 					echo
 					exitError "did not receive a timely MFA device verification"
 				fi
@@ -317,20 +401,20 @@ function doADFSAuth {
 
 				# has device verification been received?
 				responsePayload=$(
-					doADFSAuthPostMFARequest \
+					doUserCredsMFALoginPostMFARequest \
 						"$curlCookieJarTempFile" "$MFAContextToken" "" \
 						"$MFARequestURL" "$responseTempFile"
 				)
 
-				SAMLResponseToken=$(doADFSAuthGetSAMLResponseToken "$responsePayload")
+				SAMLResponseToken=$(getSAMLResponseTokenFromPayload "$responsePayload")
 				if [[ -n $SAMLResponseToken ]]; then
 					# yes, bail out with success
 					writePrompt
 					break
 				fi
 
-				MFAContextToken=$(doADFSAuthGetMFAContextToken "$responsePayload")
-				doADFSAuthVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
+				MFAContextToken=$(doUserCredsMFALoginGetMFAContextToken "$responsePayload")
+				doUserCredsMFALoginVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
 
 				# wait before the next check
 				sleep $MFA_DEVICE_VERIFY_SLEEP_TIME
@@ -340,51 +424,53 @@ function doADFSAuth {
 	fi
 
 	# verify we ended up with a SAML authorisation token
-	rm -f "$curlCookieJarTempFile"
 	if [[ -z $SAMLResponseToken ]]; then
+		rm -f "$curlCookieJarTempFile"
 		exitError "SAML authorisation request failed${MFAContextToken:+ - invalid MFA code?}"
 	fi
 
+	# retain cookies set by Azure AD to file for future use
+	if [[ $RETAIN_AZURE_AD_AUTH_COOKIES ]]; then
+		# extract cookies we need
+		# note: need to define [\t] - as GNU grep doesn't understand it with [--extended-regex] mode
+		local tabChar=$'\t'
+
+		set +e
+		retainCookieSet=$(
+			grep \
+				--extended-regex \
+				"${tabChar}(MSISAuth|MSISAuthenticated|SamlSession)${tabChar}" "$curlCookieJarTempFile"
+		)
+
+		local retVal=$?
+		set -e
+
+		if [[ $retVal -eq 0 ]]; then
+			# found cookies - save to disk
+			echo "$retainCookieSet" >"$AZURE_AD_AUTH_COOKIE_PERSIST_FILE"
+			chmod $USER_FILE_CHMOD "$AZURE_AD_AUTH_COOKIE_PERSIST_FILE"
+		fi
+	fi
+
+	rm -f "$curlCookieJarTempFile"
+
 	# sign-in was a success
 	setSAMLResponse "$SAMLResponseToken"
-
-	# if able to locate expiry time for assertion, persist SAML response for re-use next auth attempt
-	if [[ $SAMLResponseDecoded =~ \<SubjectConfirmationData[^\>]NotOnOrAfter=\"([^.]+)\.[0-9]+Z\" ]]; then
-		# found expiry time - offset by [$SAML_RESPONSE_EXPIRE_OFFSET_SECONDS] to determine how long we keep reusing response
-		# save SAML response (not decoded) to disk, with time of file set to expiry
-		echo -n "$SAMLResponse" >"$SAML_RESPONSE_PERSIST_FILE"
-
-		touch \
-			-t "$(getUTCDateSecondOffset "${BASH_REMATCH[1]}" "$SAML_RESPONSE_EXPIRE_OFFSET_SECONDS" "%Y%m%d%H%M.%S")" \
-			"$SAML_RESPONSE_PERSIST_FILE"
-
-		chmod $USER_FILE_CHMOD "$SAML_RESPONSE_PERSIST_FILE"
-
-		local timeUntil=$(getUTCDateSecondOffset "${BASH_REMATCH[1]}" "$SAML_RESPONSE_EXPIRE_OFFSET_SECONDS" "%H:%M:%S")
-		writeInfo "SAML assertion saved for reuse until $timeUntil"
-		writeInfo
-	fi
+	doSAMLResponsePersist
 }
 
-function doADFSAuthGetMFAContextToken {
+function doUserCredsMFALoginGetMFAContextToken {
 
 	# does response contain "AuthMethod" and "Context" form input values?
 	if [[
-		$1 =~ \ name=\"AuthMethod\"\ value=\"$MFA_AUTH_METHOD\" &&
-		$1 =~ \ name=\"Context\"\ value=\"([a-zA-Z0-9._-]+)\"
+		($1 =~ \ name=\"AuthMethod\"\ value=\"$MFA_AUTH_METHOD\") &&
+		($1 =~ \ name=\"Context\"\ value=\"([a-zA-Z0-9._-]+)\")
 	]]; then
 		echo -n "${BASH_REMATCH[1]}"
 	fi
 }
 
-function doADFSAuthGetSAMLResponseToken {
-
-	if [[ $1 =~ \ name=\"SAMLResponse\"\ value=\"([A-Za-z0-9=+]+)\" ]]; then
-		echo -n "${BASH_REMATCH[1]}"
-	fi
-}
-
-function doADFSAuthVerifyMFAContextToken {
+function doUserCredsMFALoginVerifyMFAContextToken {
 
 	if [[ -z $1 ]]; then
 		rm -f "$2"
@@ -392,7 +478,7 @@ function doADFSAuthVerifyMFAContextToken {
 	fi
 }
 
-function doADFSAuthPostMFARequest {
+function doUserCredsMFALoginPostMFARequest {
 
 	"$CURL_BIN" \
 		--cookie "$1" \
@@ -406,13 +492,7 @@ function doADFSAuthPostMFARequest {
 		--user-agent "$CURL_USER_AGENT" \
 		"$4" || :
 
-	doADFSAuthLoadResponse "$5"
-}
-
-function doADFSAuthLoadResponse {
-
-	[[ -f "$1" ]] && cat -v "$1"
-	rm -f "$1"
+	getTempResponsePayload "$5"
 }
 
 function parseSAMLRoleList {
@@ -556,8 +636,13 @@ destroySessionToken
 loadPersistedSAMLResponse
 
 if [[ -z $SAMLResponse ]]; then
-	# unable to use, or no persisted SAML response available - attempt ADFS sign-in
-	doADFSAuth
+	# unable to use, or no persisted SAML response available - attempt Azure AD auth cookies
+	doAzureAuthCookieLogin
+fi
+
+if [[ -z $SAMLResponse ]]; then
+	# invalid or unable to use Azure AD auth cookies - attempt user credentials/MFA sign-in
+	doUserCredsMFALogin
 fi
 
 # get roles available from decoded SAML XML response
