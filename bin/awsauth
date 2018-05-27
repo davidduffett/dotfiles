@@ -288,7 +288,7 @@ function doUserCredsMFALogin {
 
 	# get password from terminal
 	while [[ -z $enteredPassword ]]; do
-		read -rsp "Password: " enteredPassword
+		read -rsp "${PASSWORD_PROMPT:-Password}: " enteredPassword
 
 		if [[ -z $enteredPassword ]]; then
 			writePrompt "\nNo password entered"
@@ -349,7 +349,17 @@ function doUserCredsMFALogin {
 		doUserCredsMFALoginVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
 
 		# determine if code input or device authorisation mode
-		if [[ $responsePayload =~ \<input\ id=\"verificationCodeInput\" ]]; then
+		if [[ $responsePayload =~ (Enter\ the|sent\ a\ text\ message\ with\ a)\ verification\ code ]]; then
+			# code input mode, swap content token for another (to skip over the 'we are about to send you a text message' option)
+			responsePayload=$(
+				doUserCredsMFALoginPostMFARequest \
+					"$curlCookieJarTempFile" "$MFAContextToken" "" \
+					"$MFARequestURL" "$responseTempFile"
+			)
+
+			MFAContextToken=$(doUserCredsMFALoginGetMFAContextToken "$responsePayload")
+			doUserCredsMFALoginVerifyMFAContextToken "$MFAContextToken" "$curlCookieJarTempFile"
+
 			while :; do
 				# get verification code from user
 				while [[ -z $enteredVerificationCode ]]; do
@@ -394,7 +404,7 @@ function doUserCredsMFALogin {
 					rm -f "$curlCookieJarTempFile"
 
 					echo
-					exitError "did not receive a timely MFA device verification"
+					exitError "did not receive timely MFA device verification"
 				fi
 
 				writePrompt "Waiting for device authorisation..."
@@ -497,7 +507,7 @@ function doUserCredsMFALoginPostMFARequest {
 
 function parseSAMLRoleList {
 
-	IFS=$'\n'
+	local IFS=$'\n'
 
 	# line-break decoded SAML response XML on <AttributeValue> elements containing an IAM ARN
 	# note: using ${IFS} here for line-break as OSX sed does not support "\n" for replacements
@@ -524,8 +534,6 @@ function parseSAMLRoleList {
 			IAMRoleList+=("${BASH_REMATCH[1]}")
 		fi
 	done
-
-	unset IFS
 }
 
 function renderAndSelectIAMRole {
