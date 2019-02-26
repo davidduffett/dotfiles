@@ -1,9 +1,9 @@
 #! /bin/bash
 
+[[ -r ~/.bashrc ]] && . ~/.bashrc
+
 source ~/.aliases
-source ~/.path
 source ~/.bash_prompt
-source ~/.extras
 source ~/.git-completion.sh
 if [ -f ~/.locals ]; then
     source ~/.locals

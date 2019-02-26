@@ -1,17 +1,10 @@
 #!/usr/bin/env bash
 
-alias showfiles='defaults write com.apple.finder AppleShowAllFiles true; killall Finder;'
-alias hidefiles='defaults write com.apple.finder AppleShowAllFiles false; killall Finder;'
-
 alias ..="cd .."
 alias ...="cd ../.."
 alias ....="cd ../../.."
 alias .....="cd ../../../.."
 
-alias cdp="cd ~/Projects"
-alias cdgo="cd ~/Projects/go/src/github.com/SEEK-Jobs/"
+alias cdgo="cd ~/go/src/github.com/SEEK-Jobs/"
 
 alias ga="git add ."
-
-alias g="./gradlew --daemon"
-alias gp="./gradlew --daemon --parallel"
